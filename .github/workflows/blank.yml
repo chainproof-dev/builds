@@ -95,16 +95,36 @@ jobs:
             xz-utils
           sudo apt-get clean
 
-      - name: Install depot_tools
+      - name: Install and bootstrap depot_tools
         shell: bash
         run: |
           set -euxo pipefail
+
           git clone --depth=1 \
             https://chromium.googlesource.com/chromium/tools/depot_tools.git \
             "$DEPOT_TOOLS_DIR"
+
           echo "$DEPOT_TOOLS_DIR" >> "$GITHUB_PATH"
           export PATH="$DEPOT_TOOLS_DIR:$PATH"
-          gclient --version
+
+          # DEPOT_TOOLS_UPDATE=0 intentionally prevents depot_tools from
+          # changing revision during the job. It also disables automatic
+          # bootstrap, so initialize the bundled Python/CIPD tools explicitly.
+          "$DEPOT_TOOLS_DIR/ensure_bootstrap"
+
+          test -s "$DEPOT_TOOLS_DIR/python3_bin_reldir.txt"
+          test -x "$DEPOT_TOOLS_DIR/python-bin/python3"
+
+          "$DEPOT_TOOLS_DIR/python-bin/python3" --version
+          gn --version
+          command -v gclient
+          command -v autoninja
+
+          {
+            echo "depot_tools commit: $(git -C "$DEPOT_TOOLS_DIR" rev-parse HEAD)"
+            echo "python3_bin_reldir: $(cat "$DEPOT_TOOLS_DIR/python3_bin_reldir.txt")"
+            echo "gn: $(gn --version)"
+          } | tee "$RUNNER_TEMP/depot-tools-bootstrap.txt"
 
       - name: Fetch latest requested ANGLE revision
         id: source
@@ -128,17 +148,8 @@ jobs:
           git fetch --force origin "$ANGLE_REF"
           git checkout --detach FETCH_HEAD
 
-          gclient sync \
-            --nohooks \
-            --delete_unversioned_trees \
-            --force
-
-          ./build/install-build-deps.sh --no-prompt --no-syms
-          gclient runhooks
-
-          gn --version
-          autoninja --version
-
+          # Record the resolved source revision before long dependency setup so
+          # diagnostics and failure artifacts still carry the exact commit.
           commit="$(git rev-parse HEAD)"
           short_commit="$(git rev-parse --short=12 HEAD)"
           commit_time="$(git show -s --format=%cI HEAD)"
@@ -155,6 +166,20 @@ jobs:
             echo "ANGLE_SHORT_COMMIT=$short_commit"
             echo "ANGLE_COMMIT_TIME=$commit_time"
           } >> "$GITHUB_ENV"
+
+          gclient sync \
+            --nohooks \
+            --delete_unversioned_trees \
+            --force
+
+          ./build/install-build-deps.sh --no-prompt --no-syms
+          gclient runhooks
+
+          # Fail here with a focused diagnostic rather than much later in GN.
+          test -s "$DEPOT_TOOLS_DIR/python3_bin_reldir.txt"
+          test -x "$DEPOT_TOOLS_DIR/python-bin/python3"
+          gn --version
+          autoninja --version
 
           {
             echo "## ANGLE source"
@@ -354,7 +379,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: angle-build-logs-${{ steps.source.outputs.short_commit || github.run_id }}
-          path: ${{ env.LOG_DIR }}
+          path: |
+            ${{ env.LOG_DIR }}
+            ${{ runner.temp }}/depot-tools-bootstrap.txt
           if-no-files-found: warn
           compression-level: 6
           retention-days: ${{ inputs.retention_days }}
