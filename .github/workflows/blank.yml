@@ -1,4 +1,4 @@
-name: ANGLE Linux Debug, ASan, and UBSan
+name: ANGLE Linux Debug, ASan, and UBSan (v4)
 
 on:
   workflow_dispatch:
@@ -116,14 +116,19 @@ jobs:
           test -x "$DEPOT_TOOLS_DIR/python-bin/python3"
 
           "$DEPOT_TOOLS_DIR/python-bin/python3" --version
-          gn --version
           command -v gclient
           command -v autoninja
+
+          # Do not execute depot_tools/gn yet. It is only a dispatcher and
+          # requires ANGLE's real GN binary, downloaded later by gclient sync.
+          test -x "$DEPOT_TOOLS_DIR/gn"
 
           {
             echo "depot_tools commit: $(git -C "$DEPOT_TOOLS_DIR" rev-parse HEAD)"
             echo "python3_bin_reldir: $(cat "$DEPOT_TOOLS_DIR/python3_bin_reldir.txt")"
-            echo "gn: $(gn --version)"
+            echo "gclient: $(command -v gclient)"
+            echo "autoninja: $(command -v autoninja)"
+            echo "depot_tools GN dispatcher: $DEPOT_TOOLS_DIR/gn"
           } | tee "$RUNNER_TEMP/depot-tools-bootstrap.txt"
 
       - name: Fetch latest requested ANGLE revision
@@ -172,12 +177,29 @@ jobs:
             --delete_unversioned_trees \
             --force
 
+          # depot_tools/gn is a dispatcher. The actual GN executable belongs
+          # to the ANGLE checkout and is installed by the no-hooks sync above.
+          # Put the real binary first so hooks such as configure_siso.py can
+          # execute `gn --version` without recursing into the dispatcher.
+          GN_DIR="$ANGLE_SRC/buildtools/linux64"
+          GN_BIN="$GN_DIR/gn"
+          test -x "$GN_BIN"
+          export PATH="$GN_DIR:$DEPOT_TOOLS_DIR:$PATH"
+          echo "$GN_DIR" >> "$GITHUB_PATH"
+          echo "GN_BIN=$GN_BIN" >> "$GITHUB_ENV"
+
+          echo "Real ANGLE GN: $GN_BIN"
+          "$GN_BIN" --version
+          which -a gn || true
+
           ./build/install-build-deps.sh --no-prompt --no-syms
           gclient runhooks
 
           # Fail here with a focused diagnostic rather than much later in GN.
           test -s "$DEPOT_TOOLS_DIR/python3_bin_reldir.txt"
           test -x "$DEPOT_TOOLS_DIR/python-bin/python3"
+          test -x "$GN_BIN"
+          "$GN_BIN" --version
           gn --version
           autoninja --version
 
@@ -203,6 +225,8 @@ jobs:
 
           config="${1:?usage: build-angle-config.sh <debug|asan|ubsan>}"
           jobs="$(nproc --all)"
+          gn_bin="${GN_BIN:-$ANGLE_SRC/buildtools/linux64/gn}"
+          test -x "$gn_bin"
           out_rel="out/$config"
           out_dir="$ANGLE_SRC/$out_rel"
           archive="$ARCHIVE_DIR/angle-${config}-linux-x64-${ANGLE_SHORT_COMMIT}.zip"
@@ -270,8 +294,8 @@ jobs:
 
           cd "$ANGLE_SRC"
 
-          gn gen "$out_rel" --args="$gn_args" 2>&1 | tee -a "$log_file"
-          gn args "$out_rel" --list > "$out_dir/GN_ARGS_EXPANDED.txt"
+          "$gn_bin" gen "$out_rel" --args="$gn_args" 2>&1 | tee -a "$log_file"
+          "$gn_bin" args "$out_rel" --list > "$out_dir/GN_ARGS_EXPANDED.txt"
 
           autoninja -C "$out_rel" -j "$jobs" 2>&1 | tee -a "$log_file"
 
@@ -281,6 +305,8 @@ jobs:
           cat > "$out_dir/BUILD_INFO.txt" <<EOF
           ANGLE commit: $ANGLE_COMMIT
           ANGLE commit time: $ANGLE_COMMIT_TIME
+          GN binary: $gn_bin
+          GN version: $($gn_bin --version)
           Configuration: $config
           Target OS: linux
           Target CPU: x64
