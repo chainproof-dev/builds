@@ -1,0 +1,352 @@
+name: ANGLE Linux Debug, ASan, and UBSan
+
+on:
+  workflow_dispatch:
+    inputs:
+      angle_ref:
+        description: "ANGLE branch, tag, or commit SHA"
+        required: true
+        default: "refs/heads/main"
+        type: string
+      symbol_level:
+        description: "Debug-symbol level (2 is best for security research)"
+        required: true
+        default: "2"
+        type: choice
+        options:
+          - "2"
+          - "1"
+      retention_days:
+        description: "Artifact retention period"
+        required: true
+        default: "7"
+        type: choice
+        options:
+          - "3"
+          - "7"
+          - "14"
+          - "30"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: angle-linux-build
+  cancel-in-progress: false
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+  DEPOT_TOOLS_DIR: ${{ github.workspace }}/depot_tools
+  CHECKOUT_ROOT: ${{ github.workspace }}/checkout
+  ANGLE_SRC: ${{ github.workspace }}/checkout/angle
+  ARCHIVE_DIR: ${{ github.workspace }}/artifacts
+  LOG_DIR: ${{ github.workspace }}/build-logs
+  ANGLE_REF: ${{ inputs.angle_ref }}
+  SYMBOL_LEVEL: ${{ inputs.symbol_level }}
+  DEPOT_TOOLS_UPDATE: "0"
+  GCLIENT_PY3: "1"
+  NINJA_STATUS: "[%r processes, %f/%t @ %o/s, %es elapsed] "
+
+jobs:
+  build:
+    name: Sequential Linux x64 builds
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Show runner resources
+        shell: bash
+        run: |
+          set -euxo pipefail
+          uname -a
+          lscpu
+          free -h
+          df -h
+          echo "CPU jobs: $(nproc --all)"
+
+      - name: Reclaim runner disk space
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL || true
+          sudo docker system prune --all --force --volumes || true
+          sudo apt-get clean
+          df -h
+
+      - name: Install bootstrap packages
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            ca-certificates \
+            curl \
+            git \
+            lsb-release \
+            p7zip-full \
+            python3 \
+            python3-pip \
+            xz-utils
+          sudo apt-get clean
+
+      - name: Install depot_tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --depth=1 \
+            https://chromium.googlesource.com/chromium/tools/depot_tools.git \
+            "$DEPOT_TOOLS_DIR"
+          echo "$DEPOT_TOOLS_DIR" >> "$GITHUB_PATH"
+          export PATH="$DEPOT_TOOLS_DIR:$PATH"
+          gclient --version
+
+      - name: Fetch latest requested ANGLE revision
+        id: source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export PATH="$DEPOT_TOOLS_DIR:$PATH"
+
+          mkdir -p "$CHECKOUT_ROOT" "$ARCHIVE_DIR" "$LOG_DIR"
+          cd "$CHECKOUT_ROOT"
+          fetch --nohooks angle
+
+          cd "$ANGLE_SRC"
+          git fetch --force origin "$ANGLE_REF"
+          git checkout --detach FETCH_HEAD
+
+          gclient sync \
+            --nohooks \
+            --delete_unversioned_trees \
+            --force
+
+          ./build/install-build-deps.sh --no-prompt --no-syms
+          gclient runhooks
+
+          gn --version
+          autoninja --version
+
+          commit="$(git rev-parse HEAD)"
+          short_commit="$(git rev-parse --short=12 HEAD)"
+          commit_time="$(git show -s --format=%cI HEAD)"
+          subject="$(git show -s --format=%s HEAD)"
+
+          {
+            echo "commit=$commit"
+            echo "short_commit=$short_commit"
+            echo "commit_time=$commit_time"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "ANGLE_COMMIT=$commit"
+            echo "ANGLE_SHORT_COMMIT=$short_commit"
+            echo "ANGLE_COMMIT_TIME=$commit_time"
+          } >> "$GITHUB_ENV"
+
+          {
+            echo "## ANGLE source"
+            echo
+            echo "- Ref requested: \`$ANGLE_REF\`"
+            echo "- Commit: \`$commit\`"
+            echo "- Commit time: \`$commit_time\`"
+            echo "- Subject: $subject"
+            echo "- Runner CPUs: \`$(nproc --all)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          git status --short
+          df -h
+
+      - name: Create sequential build helper
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/build-angle-config.sh" <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+
+          config="${1:?usage: build-angle-config.sh <debug|asan|ubsan>}"
+          jobs="$(nproc --all)"
+          out_rel="out/$config"
+          out_dir="$ANGLE_SRC/$out_rel"
+          archive="$ARCHIVE_DIR/angle-${config}-linux-x64-${ANGLE_SHORT_COMMIT}.zip"
+          log_file="$LOG_DIR/${config}.log"
+          args_file="$LOG_DIR/${config}.args.gn"
+
+          common_args=$(cat <<EOF
+          target_cpu = "x64"
+          is_component_build = false
+          is_official_build = false
+          use_remoteexec = false
+          use_siso = false
+          symbol_level = ${SYMBOL_LEVEL}
+          EOF
+          )
+
+          case "$config" in
+            debug)
+              gn_args=$(cat <<EOF
+          ${common_args}
+          is_debug = true
+          angle_assert_always_on = true
+          dcheck_always_on = true
+          EOF
+              )
+              ;;
+            asan)
+              gn_args=$(cat <<EOF
+          ${common_args}
+          is_debug = false
+          is_asan = true
+          angle_assert_always_on = true
+          dcheck_always_on = true
+          EOF
+              )
+              ;;
+            ubsan)
+              gn_args=$(cat <<EOF
+          ${common_args}
+          is_debug = false
+          is_ubsan = true
+          is_ubsan_no_recover = true
+          angle_assert_always_on = true
+          dcheck_always_on = true
+          EOF
+              )
+              ;;
+            *)
+              echo "Unknown configuration: $config" >&2
+              exit 2
+              ;;
+          esac
+
+          mkdir -p "$out_dir" "$ARCHIVE_DIR" "$LOG_DIR"
+          printf '%s\n' "$gn_args" > "$args_file"
+
+          {
+            echo "===== ANGLE $config configuration ====="
+            echo "Commit: $ANGLE_COMMIT"
+            echo "Jobs: $jobs"
+            echo "Output: $out_dir"
+            echo
+            echo "$gn_args"
+          } | tee "$log_file"
+
+          cd "$ANGLE_SRC"
+
+          gn gen "$out_rel" --args="$gn_args" 2>&1 | tee -a "$log_file"
+          gn args "$out_rel" --list > "$out_dir/GN_ARGS_EXPANDED.txt"
+
+          autoninja -C "$out_rel" -j "$jobs" 2>&1 | tee -a "$log_file"
+
+          test -s "$out_dir/libEGL.so"
+          test -s "$out_dir/libGLESv2.so"
+
+          cat > "$out_dir/BUILD_INFO.txt" <<EOF
+          ANGLE commit: $ANGLE_COMMIT
+          ANGLE commit time: $ANGLE_COMMIT_TIME
+          Configuration: $config
+          Target OS: linux
+          Target CPU: x64
+          Parallel jobs: $jobs
+          Runner: ${RUNNER_NAME:-unknown}
+          Runner OS: ${RUNNER_OS:-unknown}
+          Runner architecture: ${RUNNER_ARCH:-unknown}
+          Built UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          EOF
+
+          find "$out_dir" -maxdepth 1 -type f -printf '%f\t%s bytes\n' \
+            | sort > "$out_dir/TOP_LEVEL_FILES.txt"
+
+          rm -f "$archive" "$archive.sha256"
+          7z a -tzip -mx=1 -mmt=on "$archive" "$out_rel"
+          sha256sum "$archive" | tee "$archive.sha256"
+
+          archive_size="$(du -h "$archive" | cut -f1)"
+          {
+            echo
+            echo "### ${config^^}"
+            echo
+            echo "- Archive: \`$(basename "$archive")\`"
+            echo "- Size: \`$archive_size\`"
+            echo "- SHA-256: \`$(cut -d' ' -f1 "$archive.sha256")\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          rm -rf "$out_dir"
+          df -h
+          SCRIPT
+
+          chmod +x "$RUNNER_TEMP/build-angle-config.sh"
+
+      - name: Build and package Debug
+        shell: bash
+        run: "$RUNNER_TEMP/build-angle-config.sh debug"
+
+      - name: Upload Debug build
+        uses: actions/upload-artifact@v7
+        with:
+          name: angle-debug-linux-x64-${{ steps.source.outputs.short_commit }}
+          path: |
+            ${{ env.ARCHIVE_DIR }}/angle-debug-linux-x64-${{ steps.source.outputs.short_commit }}.zip
+            ${{ env.ARCHIVE_DIR }}/angle-debug-linux-x64-${{ steps.source.outputs.short_commit }}.zip.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: ${{ inputs.retention_days }}
+
+      - name: Remove uploaded Debug package
+        if: always()
+        shell: bash
+        run: rm -f "$ARCHIVE_DIR"/angle-debug-linux-x64-*.zip*
+
+      - name: Build and package ASan
+        shell: bash
+        run: "$RUNNER_TEMP/build-angle-config.sh asan"
+
+      - name: Upload ASan build
+        uses: actions/upload-artifact@v7
+        with:
+          name: angle-asan-linux-x64-${{ steps.source.outputs.short_commit }}
+          path: |
+            ${{ env.ARCHIVE_DIR }}/angle-asan-linux-x64-${{ steps.source.outputs.short_commit }}.zip
+            ${{ env.ARCHIVE_DIR }}/angle-asan-linux-x64-${{ steps.source.outputs.short_commit }}.zip.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: ${{ inputs.retention_days }}
+
+      - name: Remove uploaded ASan package
+        if: always()
+        shell: bash
+        run: rm -f "$ARCHIVE_DIR"/angle-asan-linux-x64-*.zip*
+
+      - name: Build and package UBSan
+        shell: bash
+        run: "$RUNNER_TEMP/build-angle-config.sh ubsan"
+
+      - name: Upload UBSan build
+        uses: actions/upload-artifact@v7
+        with:
+          name: angle-ubsan-linux-x64-${{ steps.source.outputs.short_commit }}
+          path: |
+            ${{ env.ARCHIVE_DIR }}/angle-ubsan-linux-x64-${{ steps.source.outputs.short_commit }}.zip
+            ${{ env.ARCHIVE_DIR }}/angle-ubsan-linux-x64-${{ steps.source.outputs.short_commit }}.zip.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: ${{ inputs.retention_days }}
+
+      - name: Remove uploaded UBSan package
+        if: always()
+        shell: bash
+        run: rm -f "$ARCHIVE_DIR"/angle-ubsan-linux-x64-*.zip*
+
+      - name: Upload build logs and resolved GN arguments
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: angle-build-logs-${{ steps.source.outputs.short_commit || github.run_id }}
+          path: ${{ env.LOG_DIR }}
+          if-no-files-found: warn
+          compression-level: 6
+          retention-days: ${{ inputs.retention_days }}
